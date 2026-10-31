@@ -206,7 +206,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "sub_agent",
     label: "Sylvan Sub-agent",
-    description: "Send a message to a fresh saved Pi sub-agent on this agent's Sylvan Space and working directory. Waits for process exit and returns only assistant text, not thinking, tool calls, or tool results. Both conversations are visible in Sylvan's Agents UI. The child uses the Space's native Pi configuration and does not inherit this conversation. Requires this Pi process to have been launched by Sylvan and its own Space in permittedSpaces. The new child inherits permittedSpaces and permitSpaceCreation. Cancellation or a lost HTTP response stops observation, not the child; inspect its saved conversation before starting a replacement. Only a repeated invocation with the same Pi tool-call ID reuses its request ID; a fresh tool-call ID gets a new request ID and may duplicate the operation. Parent and child share files, so coordinate edits.",
+    description: "Send a message to a fresh saved Pi sub-agent on this agent's Sylvan Space and working directory. Waits for process exit and returns only assistant text, not thinking, tool calls, or tool results. Both conversations are visible in Sylvan's Agents UI. The child uses the Space's native Pi configuration and does not inherit this conversation. Requires this Pi process to have been launched by Sylvan and its own Space in permittedSpaces. The new child inherits permittedSpaces, permittedRootSpaces and permitSpaceCreation. Cancellation or a lost HTTP response stops observation, not the child; inspect its saved conversation before starting a replacement. Only a repeated invocation with the same Pi tool-call ID reuses its request ID; a fresh tool-call ID gets a new request ID and may duplicate the operation. Parent and child share files, so coordinate edits.",
     parameters: Type.Object({
       message: Type.String({ minLength: 1, maxLength: 100000, description: "The complete task/message for the sub-agent's fresh context." }),
     }),
@@ -247,7 +247,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_agent_session",
     label: "Create Agent Session",
-    description: "Create a fresh saved Pi conversation on a permitted running Space and send its first message. The new agent inherits permittedSpaces and permitSpaceCreation. Waits for process exit and returns spaceId, sessionId and assistant text; use the returned ID with send_agent_message. Uses destination native settings/auth, with no config or credential parameters. Requires a Sylvan-launched caller. Busy unrelated Space lanes fail rather than queue. Cancellation or a lost HTTP response ends observation, not inference. Inspect recent sessions with list_agent_sessions before submitting a new create; a fresh tool-call ID gets a new request ID and may duplicate work.",
+    description: "Create a fresh saved Pi conversation on a permitted running Space and send its first message. The new agent inherits permittedSpaces, permittedRootSpaces and permitSpaceCreation. Waits for process exit and returns spaceId, sessionId and assistant text; use the returned ID with send_agent_message. Uses destination native settings/auth, with no config or credential parameters. Requires a Sylvan-launched caller. Busy unrelated Space lanes fail rather than queue. Cancellation or a lost HTTP response ends observation, not inference. Inspect recent sessions with list_agent_sessions before submitting a new create; a fresh tool-call ID gets a new request ID and may duplicate work.",
     parameters: Type.Object({
       spaceId: Type.String({ description: "The destination Space ID." }),
       message: Type.String({ minLength: 1, maxLength: 100000, description: "The complete initial task/message for a fresh context." }),
@@ -281,7 +281,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_space",
     label: "Create Sylvan Space",
-    description: "Create an Arch Sylvan Space when this agent's permitSpaceCreation is true. Its ID is automatically added to the caller's permittedSpaces. Provisioning is asynchronous; poll list_spaces until it is Running.",
+    description: "Create an Arch Sylvan Space when this agent's permitSpaceCreation is true. Its ID is automatically added to the caller's permittedSpaces and permittedRootSpaces. Provisioning is asynchronous; poll list_spaces until it is Running.",
     parameters: Type.Object({
       name: Type.String({ description: "Name for the new Space." }),
     }),
@@ -320,7 +320,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "send_command",
     label: "Send Sylvan Developer Shell Command",
-    description: "Send a command to a Developer Shell owned by this Pi session. Requires current permission for its Space and a live Sylvan caller, even for shells created earlier. Command output is limited to the last 50 KB.",
+    description: "Send a command to a Developer Shell owned by this Pi session. Requires current permission for its Space and a live Sylvan caller, even for shells created earlier. Root Shells cannot be used through this tool. Command output is limited to the last 50 KB.",
     parameters: Type.Object({
       shellId: Type.String({ description: "The owned Developer Shell ID." }),
       command: Type.String({ description: "The command to run." }),
@@ -328,6 +328,46 @@ export default function registerSylvan(pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal) {
       const result = normalizeCommandResult(await call(
         "send_command",
+        { shellId: params.shellId, command: params.command },
+        signal,
+      ));
+      return { content: [{ type: "text", text: toolText(result) }], details: result };
+    },
+  });
+
+  pi.registerTool({
+    name: "list_root_shells",
+    label: "List Owned Root Shells",
+    description: "List active Root Shells owned by this MCP session. Requires a live Sylvan-launched caller and the Space in both permittedSpaces and permittedRootSpaces. The server fixes the shell role as Root. This is cooperative MCP policy, not a sandbox or REST authorization boundary.",
+    parameters: Type.Object({ spaceId: Type.String({ description: "The Space ID." }) }, { additionalProperties: false }),
+    async execute(_toolCallId, params, signal) {
+      const result = await call("list_root_shells", { spaceId: params.spaceId }, signal);
+      return { content: [{ type: "text", text: toolText(result) }], details: result };
+    },
+  });
+
+  pi.registerTool({
+    name: "create_root_shell",
+    label: "Create Root Shell",
+    description: "Create a Root Shell owned by this MCP session. Requires a live Sylvan-launched caller and the Space in both permittedSpaces and permittedRootSpaces. The server fixes the shell role as Root; callers cannot select a user or role. This is cooperative MCP policy, not a sandbox or REST authorization boundary.",
+    parameters: Type.Object({ spaceId: Type.String({ description: "The Space ID." }) }, { additionalProperties: false }),
+    async execute(_toolCallId, params, signal) {
+      const result = await call("create_root_shell", { spaceId: params.spaceId }, signal);
+      return { content: [{ type: "text", text: toolText(result) }], details: result };
+    },
+  });
+
+  pi.registerTool({
+    name: "send_root_command",
+    label: "Send Sylvan Root Shell Command",
+    description: "Send a command to a Root Shell owned by this MCP session. Requires a live Sylvan-launched caller; the Space must be in both permittedSpaces and permittedRootSpaces, and both grants are rechecked for every command. Developer Shells cannot be used through this tool. This is cooperative MCP policy, not a sandbox or REST authorization boundary. Command output is limited to the last 50 KB.",
+    parameters: Type.Object({
+      shellId: Type.String({ description: "The owned Root Shell ID." }),
+      command: Type.String({ description: "The command to run with Root Shell privileges inside the Space." }),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, params, signal) {
+      const result = normalizeCommandResult(await call(
+        "send_root_command",
         { shellId: params.shellId, command: params.command },
         signal,
       ));

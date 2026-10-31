@@ -8,6 +8,11 @@ test("real MCP transport binds initialization to the process and returns unwrapp
   const originalUrl = process.env.SYLVAN_MCP_URL;
   const originalRun = process.env.SYLVAN_AGENT_RUN_ID;
   const requests: Array<{ method: string; run: unknown; name?: string; args?: unknown }> = [];
+  const rootShellResponse = {
+    id: "root-shell", name: "Root Shell", status: "Running", isSpaceShell: true,
+    createdAt: "2026-10-31T00:00:00Z", exitedAt: null, exitCode: null, columns: 80, rows: 24,
+  };
+  const rootCommandResponse = { shellId: "root-shell", exitCode: 0, output: "fixture output", truncated: false, status: "Running" };
   const server = createServer(async (request, response) => {
     if (request.method === "GET") { response.writeHead(405).end(); return; }
     if (request.method === "DELETE") { response.writeHead(204).end(); return; }
@@ -20,6 +25,9 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     response.setHeader("Mcp-Session-Id", "fixture-mcp-session");
     const data = rpc.params?.name === "list_agent_sessions" ? [{ id: "native-child", cwd: "/project", status: "idle" }]
       : rpc.params?.name === "list_leafs" ? [{ id: "leaf-1", projectId: "project-1", title: "Example", description: null, status: 2, dueDate: "2030-01-01T12:00:00Z", parentLeafId: null, associations: [] }]
+      : rpc.params?.name === "list_root_shells" ? [rootShellResponse]
+      : rpc.params?.name === "create_root_shell" ? rootShellResponse
+      : rpc.params?.name === "send_root_command" ? rootCommandResponse
       : { sessionId: "native-child", text: "assistant reply", ...(rpc.params?.name === "sub_agent" ? {} : { spaceId: "destination-space" }) };
     const result = rpc.method === "initialize" ? {
       protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "0.1.0" },
@@ -36,7 +44,7 @@ test("real MCP transport binds initialization to the process and returns unwrapp
   let shutdown: (() => Promise<void>) | undefined;
   try {
     registerSylvan({ registerTool: (tool: { name: string }) => tools.set(tool.name, tool), on: (_event: string, handler: () => Promise<void>) => { shutdown = handler; } } as unknown as ExtensionAPI);
-    assert.deepEqual([...tools.keys()].sort(), ["create_agent_session", "create_dev_shell", "create_space", "list_agent_sessions", "list_dev_shells", "list_leafs", "list_spaces", "send_agent_message", "send_command", "sub_agent"]);
+    assert.deepEqual([...tools.keys()].sort(), ["create_agent_session", "create_dev_shell", "create_root_shell", "create_space", "list_agent_sessions", "list_dev_shells", "list_leafs", "list_root_shells", "list_spaces", "send_agent_message", "send_command", "send_root_command", "sub_agent"]);
     const tool = tools.get("sub_agent");
     assert.deepEqual(Object.keys(tool.parameters.properties), ["message"]);
     assert.deepEqual(await tool.execute("fixture-tool-call", { message: "task" }, undefined), {
@@ -69,8 +77,39 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     const listed = await tools.get("list_agent_sessions").execute("list-call", { spaceId: "destination-space" });
     assert.deepEqual(JSON.parse(listed.content[0].text), [{ id: "native-child", cwd: "/project", status: "idle" }]);
     assert.deepEqual(requests.find(request => request.name === "list_agent_sessions")?.args, { spaceId: "destination-space" });
+    const listRoots = tools.get("list_root_shells");
+    const createRoot = tools.get("create_root_shell");
+    const sendRoot = tools.get("send_root_command");
+    assert.deepEqual(Object.keys(listRoots.parameters.properties), ["spaceId"]);
+    assert.deepEqual(Object.keys(createRoot.parameters.properties), ["spaceId"]);
+    assert.deepEqual(Object.keys(sendRoot.parameters.properties), ["shellId", "command"]);
+    for (const rootTool of [listRoots, createRoot, sendRoot]) {
+      assert.equal(rootTool.parameters.additionalProperties, false);
+      assert.equal(Object.hasOwn(rootTool.parameters.properties, "user"), false);
+      assert.match(rootTool.description, /live Sylvan-launched caller/);
+      assert.match(rootTool.description, /permittedSpaces and permittedRootSpaces/);
+      assert.match(rootTool.description, /owned by this MCP session|owned Root Shells/);
+      assert.match(rootTool.description, /cooperative MCP policy, not a sandbox/);
+    }
+    assert.deepEqual(listRoots.parameters.required, ["spaceId"]);
+    assert.deepEqual(createRoot.parameters.required, ["spaceId"]);
+    assert.deepEqual(sendRoot.parameters.required, ["shellId", "command"]);
+    assert.match(sendRoot.description, /Developer Shells cannot be used/);
+
+    const rootList = await listRoots.execute("root-list", { spaceId: "destination-space" });
+    assert.deepEqual(JSON.parse(rootList.content[0].text), [rootShellResponse]);
+    assert.deepEqual(rootList.details, [rootShellResponse]);
+    const createdRoot = await createRoot.execute("root-create", { spaceId: "destination-space" });
+    assert.deepEqual(JSON.parse(createdRoot.content[0].text), rootShellResponse);
+    assert.deepEqual(createdRoot.details, rootShellResponse);
+    const rootCommand = await sendRoot.execute("root-command", { shellId: "root-shell", command: "fixture-command" });
+    assert.deepEqual(JSON.parse(rootCommand.content[0].text), rootCommandResponse);
+    assert.deepEqual(rootCommand.details, rootCommandResponse);
+    assert.deepEqual(requests.filter(request => ["list_root_shells", "create_root_shell", "send_root_command"].includes(request.name ?? "")).map(request => request.args), [
+      { spaceId: "destination-space" }, { spaceId: "destination-space" }, { shellId: "root-shell", command: "fixture-command" },
+    ]);
     assert.equal(requests.filter(request => request.method === "initialize").length, 1);
-    assert.equal(requests.filter(request => request.method === "tools/call").length, 6);
+    assert.equal(requests.filter(request => request.method === "tools/call").length, 9);
   } finally {
     await shutdown?.();
     server.closeAllConnections();
