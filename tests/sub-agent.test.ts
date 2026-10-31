@@ -30,7 +30,7 @@ test("only assistant text reaches model content, with the native session ID in d
   });
 });
 
-test("uncertain retries keep their request ID; later independent calls use another ID", async () => {
+test("re-execution with the same Pi tool-call ID keeps its request ID; a fresh ID gets another", async () => {
   process.env.SYLVAN_AGENT_RUN_ID = "fixture-run";
   const submissions: unknown[] = [];
   const execute = createSubAgentExecutor(async (_name, args) => {

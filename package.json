@@ -11,7 +11,8 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.5"
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "undici": "^6.29.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

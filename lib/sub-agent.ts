@@ -3,14 +3,23 @@ import { randomUUID } from "node:crypto";
 type Call = (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
 type Operation = "sub_agent" | "create_agent_session" | "send_agent_message";
 type Params = { message: string; spaceId?: string; sessionId?: string };
+type Submission = { argumentsKey: string; args: Record<string, unknown> };
+
+/** No trustworthy tool result was received; the remote operation may have been accepted. */
+export class AgentCallOutcomeUnknownError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "AgentCallOutcomeUnknownError";
+  }
+}
 
 export function createSubAgentExecutor(call: Call) {
   return createAgentMessageExecutor(call, "sub_agent");
 }
 
-/** Request identity covers the operation, destination and message, including uncertain observation retries. */
+/** A Pi tool-call ID pins one server request ID; fresh tool-call IDs are new operations. */
 export function createAgentMessageExecutor(call: Call, operation: Operation) {
-  const accepted = new Map<string, { fingerprint: string; args: Record<string, unknown> }>();
+  const accepted = new Map<string, Submission>();
   return async (toolCallId: string, params: Params, signal?: AbortSignal) => {
     if (!process.env.SYLVAN_AGENT_RUN_ID?.trim()) {
       throw new Error("Agent messaging requires a Pi process launched by Sylvan. Open a conversation in the Agents UI.");
@@ -24,14 +33,15 @@ export function createAgentMessageExecutor(call: Call, operation: Operation) {
       ...(operation === "sub_agent" ? {} : { spaceId: params.spaceId }),
       ...(operation === "send_agent_message" ? { sessionId: params.sessionId } : {}),
     };
-    const fingerprint = JSON.stringify({ operation, ...args });
+    const argumentsKey = JSON.stringify({ operation, ...args });
     let submission = accepted.get(toolCallId);
-    if (submission && submission.fingerprint !== fingerprint) throw new Error("This tool invocation was already used for a different message or destination.");
+    if (submission && submission.argumentsKey !== argumentsKey) throw new Error("This tool invocation was already used for a different message or destination.");
     if (!submission) {
       if (accepted.size >= 128) throw new Error("This Pi invocation has reached its agent request limit.");
-      submission = { fingerprint, args: { ...args, requestId: randomUUID() } };
+      submission = { argumentsKey, args: { ...args, requestId: randomUUID() } };
       accepted.set(toolCallId, submission);
     }
+
     const result = await call(operation, submission.args, signal);
     if (!result || typeof result !== "object" || !("text" in result) || typeof result.text !== "string"
       || !("sessionId" in result) || typeof result.sessionId !== "string"

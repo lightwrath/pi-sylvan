@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { createAgentMessageExecutor, createSubAgentExecutor } from "../lib/sub-agent.ts";
+import { AgentCallOutcomeUnknownError, createAgentMessageExecutor, createSubAgentExecutor } from "../lib/sub-agent.ts";
+import { createLongRunningMcpFetch, isLongRunningAgentTool, parseAgentToolTimeoutMs } from "../lib/long-running-mcp-fetch.ts";
 
 const DEFAULT_MCP_URL = "http://host.containers.internal:4007/api/v1/mcp";
 const MAX_OUTPUT_BYTES = 50 * 1024;
@@ -18,10 +19,19 @@ type McpResult = {
 class SylvanMcpConnection {
   private readonly client: Client;
   private readonly transport: StreamableHTTPClientTransport;
+  private readonly agentToolTimeoutMs: number;
+  private readonly closeLongRunningFetch: () => Promise<void>;
 
-  private constructor(client: Client, transport: StreamableHTTPClientTransport) {
+  private constructor(
+    client: Client,
+    transport: StreamableHTTPClientTransport,
+    agentToolTimeoutMs: number,
+    closeLongRunningFetch: () => Promise<void>,
+  ) {
     this.client = client;
     this.transport = transport;
+    this.agentToolTimeoutMs = agentToolTimeoutMs;
+    this.closeLongRunningFetch = closeLongRunningFetch;
   }
 
   static async connect(signal?: AbortSignal): Promise<SylvanMcpConnection> {
@@ -38,19 +48,39 @@ class SylvanMcpConnection {
       { capabilities: {} },
     );
     const runId = process.env.SYLVAN_AGENT_RUN_ID?.trim();
+    const agentToolTimeoutMs = parseAgentToolTimeoutMs();
+    const longRunningFetch = createLongRunningMcpFetch(agentToolTimeoutMs);
     const transport = new StreamableHTTPClientTransport(url, {
       requestInit: runId ? { headers: { "Sylvan-Agent-Run": runId } } : undefined,
+      fetch: longRunningFetch.fetch,
     });
-    await client.connect(transport, { signal });
-    return new SylvanMcpConnection(client, transport);
+    try {
+      await client.connect(transport, { signal });
+    } catch (error) {
+      await client.close().catch(() => undefined);
+      await longRunningFetch.close().catch(() => undefined);
+      throw error;
+    }
+    return new SylvanMcpConnection(client, transport, agentToolTimeoutMs, longRunningFetch.close);
   }
 
   async call(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<JsonValue> {
-    const result = await this.client.callTool({ name, arguments: args }, undefined, {
-      signal,
-      // Delegation can involve many model/tool turns; the SDK's default is only 60 seconds.
-      timeout: ["sub_agent", "create_agent_session", "send_agent_message"].includes(name) ? 24 * 60 * 60 * 1000 : undefined,
-    }) as McpResult;
+    signal?.throwIfAborted();
+    let result: McpResult;
+    try {
+      result = await this.client.callTool({ name, arguments: args }, undefined, {
+        signal,
+        // The SDK default is 60 seconds. Keep its deadline just inside Undici's HTTP deadline.
+        timeout: isLongRunningAgentTool(name) ? this.agentToolTimeoutMs : undefined,
+      }) as McpResult;
+    } catch (error) {
+      // Any rejected tools/call response is ambiguous: the request may have reached Sylvan
+      // even when the HTTP status, body or protocol response is invalid.
+      if (isLongRunningAgentTool(name)) {
+        throw new AgentCallOutcomeUnknownError(uncertainAgentCallMessage(name), error);
+      }
+      throw error;
+    }
     if (result.isError) {
       throw new Error(readText(result) || `Sylvan MCP tool '${name}' failed.`);
     }
@@ -62,13 +92,26 @@ class SylvanMcpConnection {
     try {
       await this.transport.terminateSession();
     } finally {
-      await this.client.close();
+      try {
+        await this.client.close();
+      } finally {
+        await this.closeLongRunningFetch();
+      }
     }
   }
 
   private get sessionId(): string | undefined {
     return this.transport.sessionId;
   }
+}
+
+function uncertainAgentCallMessage(name: string): string {
+  const recovery = name === "create_agent_session"
+    ? "Inspect recent sessions in the destination Space with list_agent_sessions before submitting another create."
+    : name === "send_agent_message"
+      ? "Check the exact session's status and history in the Agents UI before sending another follow-up."
+      : "Inspect the Agents UI or session list before starting a replacement child.";
+  return `The outcome of '${name}' is unknown: the request may have reached Sylvan and the agent may still be running or may already have completed. An HTTP error, timeout, cancellation, or invalid response does not prove the operation failed before starting. No automatic retry was made. ${recovery} A fresh tool call gets a new request ID and may duplicate the operation; inspect first.`;
 }
 
 function readText(result: McpResult): string {
@@ -145,7 +188,10 @@ export default function registerSylvan(pi: ExtensionAPI) {
     name: string,
     args: Record<string, unknown>,
     signal?: AbortSignal,
-  ): Promise<JsonValue> => (await getConnection(signal)).call(name, args, signal);
+  ): Promise<JsonValue> => {
+    signal?.throwIfAborted();
+    return (await getConnection(signal)).call(name, args, signal);
+  };
 
   pi.on("session_shutdown", async () => {
     const current = connection;
@@ -160,7 +206,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "sub_agent",
     label: "Sylvan Sub-agent",
-    description: "Send a message to a fresh saved Pi sub-agent on this agent's Sylvan Space and working directory. Waits for process exit and returns only assistant text, not thinking, tool calls, or tool results. Both conversations are visible in Sylvan's Agents UI. The child uses the Space's native Pi configuration and does not inherit this conversation. Requires this Pi process to have been launched by Sylvan and its own Space in permittedSpaces. The new child inherits permittedSpaces and permitSpaceCreation. Cancellation stops observation, not the child; inspect its conversation before retrying uncertain work. Parent and child share files, so coordinate edits.",
+    description: "Send a message to a fresh saved Pi sub-agent on this agent's Sylvan Space and working directory. Waits for process exit and returns only assistant text, not thinking, tool calls, or tool results. Both conversations are visible in Sylvan's Agents UI. The child uses the Space's native Pi configuration and does not inherit this conversation. Requires this Pi process to have been launched by Sylvan and its own Space in permittedSpaces. The new child inherits permittedSpaces and permitSpaceCreation. Cancellation or a lost HTTP response stops observation, not the child; inspect its saved conversation before starting a replacement. Only a repeated invocation with the same Pi tool-call ID reuses its request ID; a fresh tool-call ID gets a new request ID and may duplicate the operation. Parent and child share files, so coordinate edits.",
     parameters: Type.Object({
       message: Type.String({ minLength: 1, maxLength: 100000, description: "The complete task/message for the sub-agent's fresh context." }),
     }),
@@ -179,9 +225,29 @@ export default function registerSylvan(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "list_leafs",
+    label: "List Leafs",
+    description: "List Leafs across all Projects. With no status, includes Backlog, Pending, Doing, Done and Closed. Optionally filter using one canonical title-case status name exactly as listed: Backlog, Pending, Doing, Done or Closed. Returns a JSON array with id, projectId, title, description, numeric status (0=Backlog, 1=Pending, 2=Doing, 3=Done, 4=Closed), dueDate, parentLeafId and associations [{ id, type }], where association type is numeric (1=Leaf, 2=Checklist), ordered by status, due date and ID. Requires a live Sylvan caller; Leafs are global and are not filtered by permittedSpaces.",
+    parameters: Type.Object({
+      status: Type.Optional(Type.Union([
+        Type.Literal("Backlog"),
+        Type.Literal("Pending"),
+        Type.Literal("Doing"),
+        Type.Literal("Done"),
+        Type.Literal("Closed"),
+      ], { description: "Use one canonical title-case status name exactly as listed; omit to include all statuses, including Closed." })),
+    }, { additionalProperties: false }),
+    async execute(_toolCallId, params, signal) {
+      const args = params.status === undefined ? {} : { status: params.status };
+      const result = await call("list_leafs", args, signal);
+      return { content: [{ type: "text", text: toolText(result) }], details: result };
+    },
+  });
+
+  pi.registerTool({
     name: "create_agent_session",
     label: "Create Agent Session",
-    description: "Create a fresh saved Pi conversation on a permitted running Space and send its first message. The new agent inherits permittedSpaces and permitSpaceCreation. Waits for process exit and returns spaceId, sessionId and assistant text; use the returned ID with send_agent_message. Uses destination native settings/auth, with no config or credential parameters. Requires a Sylvan-launched caller. Busy unrelated Space lanes fail rather than queue. Cancellation ends observation, not inference; inspect saved sessions before retrying uncertain tasks.",
+    description: "Create a fresh saved Pi conversation on a permitted running Space and send its first message. The new agent inherits permittedSpaces and permitSpaceCreation. Waits for process exit and returns spaceId, sessionId and assistant text; use the returned ID with send_agent_message. Uses destination native settings/auth, with no config or credential parameters. Requires a Sylvan-launched caller. Busy unrelated Space lanes fail rather than queue. Cancellation or a lost HTTP response ends observation, not inference. Inspect recent sessions with list_agent_sessions before submitting a new create; a fresh tool-call ID gets a new request ID and may duplicate work.",
     parameters: Type.Object({
       spaceId: Type.String({ description: "The destination Space ID." }),
       message: Type.String({ minLength: 1, maxLength: 100000, description: "The complete initial task/message for a fresh context." }),
@@ -192,7 +258,7 @@ export default function registerSylvan(pi: ExtensionAPI) {
   pi.registerTool({
     name: "send_agent_message",
     label: "Send Agent Message",
-    description: "Send a follow-up to any exact listed native Pi session on the selected Space, preserving its history and using its recorded working directory. Resumes an idle session in a new process; it does not inject into an active process. Waits for completion and returns only new assistant text, not old history/thinking/tool output. Busy/editing/queued sessions and unrelated busy Space lanes fail rather than queue. Requires a Sylvan-launched caller and the destination in permittedSpaces. Existing destination agents keep their own permissions; all native sessions within an allowed Space remain addressable. Cancellation ends observation, not inference; inspect the target before retrying uncertain work.",
+    description: "Send a follow-up to any exact listed native Pi session on the selected Space, preserving its history and using its recorded working directory. Resumes an idle session in a new process; it does not inject into an active process. Waits for completion and returns only new assistant text, not old history/thinking/tool output. Busy/editing/queued sessions and unrelated busy Space lanes fail rather than queue. Requires a Sylvan-launched caller and the destination in permittedSpaces. Existing destination agents keep their own permissions; all native sessions within an allowed Space remain addressable. Cancellation or a lost HTTP response ends observation, not inference. Check the exact session's status/history before sending another follow-up; a fresh tool-call ID gets a new request ID and may duplicate the message.",
     parameters: Type.Object({
       spaceId: Type.String({ description: "The destination Space ID." }),
       sessionId: Type.String({ description: "The exact full native Pi session ID from list_agent_sessions or create_agent_session, not a file path or prefix." }),

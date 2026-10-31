@@ -19,6 +19,7 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     response.setHeader("Content-Type", "application/json");
     response.setHeader("Mcp-Session-Id", "fixture-mcp-session");
     const data = rpc.params?.name === "list_agent_sessions" ? [{ id: "native-child", cwd: "/project", status: "idle" }]
+      : rpc.params?.name === "list_leafs" ? [{ id: "leaf-1", projectId: "project-1", title: "Example", description: null, status: 2, dueDate: "2030-01-01T12:00:00Z", parentLeafId: null, associations: [] }]
       : { sessionId: "native-child", text: "assistant reply", ...(rpc.params?.name === "sub_agent" ? {} : { spaceId: "destination-space" }) };
     const result = rpc.method === "initialize" ? {
       protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "0.1.0" },
@@ -35,7 +36,7 @@ test("real MCP transport binds initialization to the process and returns unwrapp
   let shutdown: (() => Promise<void>) | undefined;
   try {
     registerSylvan({ registerTool: (tool: { name: string }) => tools.set(tool.name, tool), on: (_event: string, handler: () => Promise<void>) => { shutdown = handler; } } as unknown as ExtensionAPI);
-    assert.deepEqual([...tools.keys()].sort(), ["create_agent_session", "create_dev_shell", "create_space", "list_agent_sessions", "list_dev_shells", "list_spaces", "send_agent_message", "send_command", "sub_agent"]);
+    assert.deepEqual([...tools.keys()].sort(), ["create_agent_session", "create_dev_shell", "create_space", "list_agent_sessions", "list_dev_shells", "list_leafs", "list_spaces", "send_agent_message", "send_command", "sub_agent"]);
     const tool = tools.get("sub_agent");
     assert.deepEqual(Object.keys(tool.parameters.properties), ["message"]);
     assert.deepEqual(await tool.execute("fixture-tool-call", { message: "task" }, undefined), {
@@ -44,6 +45,18 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     assert.equal(requests.find(request => request.method === "initialize")?.run, "fixture-run");
     assert.equal(requests.find(request => request.method === "tools/call")?.run, "fixture-run");
     assert.equal(requests.filter(request => request.method === "tools/call").length, 1);
+    const leafs = tools.get("list_leafs");
+    assert.deepEqual(Object.keys(leafs.parameters.properties), ["status"]);
+    assert.match(leafs.description, /canonical title-case status name exactly as listed/);
+    assert.match(leafs.parameters.properties.status.description, /canonical title-case status name exactly as listed/);
+    assert.equal(leafs.parameters.additionalProperties, false);
+    assert.equal(leafs.parameters.required?.includes("status") ?? false, false);
+    assert.deepEqual(leafs.parameters.properties.status.anyOf.map((item: { const: string }) => item.const), ["Backlog", "Pending", "Doing", "Done", "Closed"]);
+    const allLeafs = await leafs.execute("leafs-all", {});
+    assert.deepEqual(JSON.parse(allLeafs.content[0].text), [{ id: "leaf-1", projectId: "project-1", title: "Example", description: null, status: 2, dueDate: "2030-01-01T12:00:00Z", parentLeafId: null, associations: [] }]);
+    const filteredLeafs = await leafs.execute("leafs-filtered", { status: "Doing" });
+    assert.deepEqual(JSON.parse(filteredLeafs.content[0].text), JSON.parse(allLeafs.content[0].text));
+    assert.deepEqual(requests.filter(request => request.name === "list_leafs").map(request => request.args), [{}, { status: "Doing" }]);
     const create = tools.get("create_agent_session"); const send = tools.get("send_agent_message");
     assert.deepEqual(Object.keys(create.parameters.properties), ["spaceId", "message"]);
     assert.deepEqual(Object.keys(send.parameters.properties), ["spaceId", "sessionId", "message"]);
@@ -57,7 +70,7 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     assert.deepEqual(JSON.parse(listed.content[0].text), [{ id: "native-child", cwd: "/project", status: "idle" }]);
     assert.deepEqual(requests.find(request => request.name === "list_agent_sessions")?.args, { spaceId: "destination-space" });
     assert.equal(requests.filter(request => request.method === "initialize").length, 1);
-    assert.equal(requests.filter(request => request.method === "tools/call").length, 4);
+    assert.equal(requests.filter(request => request.method === "tools/call").length, 6);
   } finally {
     await shutdown?.();
     server.closeAllConnections();

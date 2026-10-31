@@ -1,6 +1,6 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { createAgentMessageExecutor } from "../lib/sub-agent.ts";
+import { AgentCallOutcomeUnknownError, createAgentMessageExecutor } from "../lib/sub-agent.ts";
 
 const originalRun = process.env.SYLVAN_AGENT_RUN_ID;
 afterEach(() => {
@@ -26,7 +26,7 @@ test("creation exposes the addressable native ID but continuation content is onl
   assert.doesNotMatch(JSON.stringify([created, continued]), /PRIVATE/);
 });
 
-test("remote retry identity is stable and cannot be reused for another Space, session, or message", async () => {
+test("the same Pi tool-call ID retains its request ID and cannot be reused for different arguments", async () => {
   process.env.SYLVAN_AGENT_RUN_ID = "fixture-run";
   const submissions: Record<string, unknown>[] = [];
   const execute = createAgentMessageExecutor(async (_name, args) => {
@@ -42,6 +42,37 @@ test("remote retry identity is stable and cannot be reused for another Space, se
   await execute("send-2", params);
   assert.equal(submissions[0].requestId, submissions[1].requestId);
   assert.notEqual(submissions[1].requestId, submissions[2].requestId);
+});
+
+test("a fresh tool-call ID after an uncertain create gets a new request ID", async () => {
+  process.env.SYLVAN_AGENT_RUN_ID = "fixture-run";
+  const submissions: Record<string, unknown>[] = [];
+  const execute = createAgentMessageExecutor(async (_name, args) => {
+    submissions.push(args);
+    if (submissions.length === 1) throw new AgentCallOutcomeUnknownError("response lost; outcome is unknown");
+    return { spaceId: "space-b", sessionId: "native", text: "reply" };
+  }, "create_agent_session");
+  const params = { spaceId: "space-b", message: "initial" };
+  await assert.rejects(execute("create-1", params), /outcome is unknown/);
+  await execute("create-2", params);
+  assert.notEqual(submissions[0].requestId, submissions[1].requestId);
+});
+
+test("overlapping identical calls with distinct Pi tool-call IDs get independent request IDs", async () => {
+  process.env.SYLVAN_AGENT_RUN_ID = "fixture-run";
+  const submissions: Record<string, unknown>[] = [];
+  const resolvers: Array<(value: unknown) => void> = [];
+  const execute = createAgentMessageExecutor(async (_name, args) => {
+    submissions.push(args);
+    return await new Promise(resolve => resolvers.push(resolve));
+  }, "create_agent_session");
+  const params = { spaceId: "space-b", message: "same task" };
+  const first = execute("create-1", params);
+  const second = execute("create-2", params);
+  assert.equal(submissions.length, 2);
+  assert.notEqual(submissions[0].requestId, submissions[1].requestId);
+  for (const resolve of resolvers) resolve({ spaceId: "space-b", sessionId: "native", text: "reply" });
+  await Promise.all([first, second]);
 });
 
 test("remote tools reject missing caller/targets, config, auth and response wrappers without usable destination metadata", async () => {
