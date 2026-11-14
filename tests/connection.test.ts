@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import registerSylvan from "../extensions/index.ts";
+import { AgentCallOutcomeUnknownError } from "../lib/sub-agent.ts";
 
 test("real MCP transport binds initialization to the process and returns unwrapped assistant content", async () => {
   const originalUrl = process.env.SYLVAN_MCP_URL;
@@ -110,6 +111,123 @@ test("real MCP transport binds initialization to the process and returns unwrapp
     ]);
     assert.equal(requests.filter(request => request.method === "initialize").length, 1);
     assert.equal(requests.filter(request => request.method === "tools/call").length, 9);
+  } finally {
+    await shutdown?.();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    if (originalUrl === undefined) delete process.env.SYLVAN_MCP_URL; else process.env.SYLVAN_MCP_URL = originalUrl;
+    if (originalRun === undefined) delete process.env.SYLVAN_AGENT_RUN_ID; else process.env.SYLVAN_AGENT_RUN_ID = originalRun;
+  }
+});
+
+test("MCP session resets do not replay uncertain calls or bypass live-run authorization", async () => {
+  const originalUrl = process.env.SYLVAN_MCP_URL;
+  const originalRun = process.env.SYLVAN_AGENT_RUN_ID;
+  const sessions = new Set<string>();
+  const sessionCallers = new Map<string, string | undefined>();
+  const liveRuns = new Set(["fixture-run"]);
+  const attemptedTools: string[] = [];
+  const acceptedTools: string[] = [];
+  const deniedTools: string[] = [];
+  let initialized = 0;
+  const server = createServer(async (request, response) => {
+    if (request.method === "GET") { response.writeHead(405).end(); return; }
+    if (request.method === "DELETE") { response.writeHead(204).end(); return; }
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    const rpc = JSON.parse(body);
+    if (rpc.method === "initialize") {
+      const session = `fixture-session-${++initialized}`;
+      sessions.add(session);
+      const caller = request.headers["sylvan-agent-run"];
+      sessionCallers.set(session, typeof caller === "string" ? caller : undefined);
+      response.writeHead(200, { "content-type": "application/json", "mcp-session-id": session });
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: {
+        protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fixture", version: "0.1.0" },
+      } }));
+      return;
+    }
+    if (rpc.id === undefined) { response.writeHead(202).end(); return; }
+    const name = rpc.method === "tools/call" ? rpc.params?.name as string : undefined;
+    if (name) attemptedTools.push(name);
+    const session = request.headers["mcp-session-id"];
+    if (typeof session !== "string" || !sessions.has(session)) {
+      response.writeHead(400).end("Unknown MCP session");
+      return;
+    }
+    if (rpc.method === "tools/call") {
+      const caller = sessionCallers.get(session);
+      if (!caller || !liveRuns.has(caller)) {
+        deniedTools.push(name!);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: {
+          content: [{ type: "text", text: "MCP actions require a live Pi process launched by Sylvan." }],
+          isError: true,
+        } }));
+        return;
+      }
+      acceptedTools.push(name!);
+      const content = name === "list_spaces" ? "[]" : JSON.stringify({ spaceId: "destination", sessionId: "child", text: "answer" });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: {
+        content: [{ type: "text", text: content }],
+        ...(name === "list_spaces" ? {} : { structuredContent: { spaceId: "destination", sessionId: "child", text: "answer" } }),
+        isError: false,
+      } }));
+      return;
+    }
+    response.writeHead(202).end();
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  process.env.SYLVAN_MCP_URL = `http://127.0.0.1:${address.port}/api/v1/mcp`;
+  process.env.SYLVAN_AGENT_RUN_ID = "fixture-run";
+  const tools = new Map<string, any>();
+  let shutdown: (() => Promise<void>) | undefined;
+  try {
+    registerSylvan({
+      registerTool: (tool: { name: string }) => tools.set(tool.name, tool),
+      on: (_event: string, handler: () => Promise<void>) => { shutdown = handler; },
+    } as unknown as ExtensionAPI);
+    await tools.get("list_spaces").execute("initial-list", {});
+    assert.equal(initialized, 1);
+
+    // Model only an MCP session-registry reset while the original server-side run remains live.
+    sessions.clear();
+    sessionCallers.clear();
+    await assert.rejects(
+      tools.get("create_agent_session").execute("uncertain-create", { spaceId: "destination", message: "task" }),
+      (error: unknown) => error instanceof AgentCallOutcomeUnknownError,
+    );
+    assert.deepEqual(attemptedTools, ["list_spaces", "create_agent_session"]);
+    assert.deepEqual(acceptedTools, ["list_spaces"]); // The stale session rejected create; it was not retried.
+
+    const recovered = await tools.get("list_spaces").execute("recovered-list", {});
+    assert.equal(initialized, 2);
+    assert.deepEqual(JSON.parse(recovered.content[0].text), []);
+    assert.deepEqual(acceptedTools, ["list_spaces", "list_spaces"]); // Transport recovery works while the run remains live.
+
+    // A full backend restart also loses AgentRunRegistry state. A new MCP session must not
+    // turn the old process's run ID into a live caller or restore access to tools.
+    sessions.clear();
+    sessionCallers.clear();
+    liveRuns.clear();
+    await assert.rejects(
+      tools.get("create_agent_session").execute("post-restart-create", { spaceId: "destination", message: "task" }),
+      (error: unknown) => error instanceof AgentCallOutcomeUnknownError,
+    );
+    await assert.rejects(
+      tools.get("list_spaces").execute("post-restart-list", {}),
+      (error: unknown) => error instanceof Error
+        && !(error instanceof AgentCallOutcomeUnknownError)
+        && /live Pi process launched by Sylvan/.test(error.message),
+    );
+    assert.equal(initialized, 3);
+    assert.equal(sessionCallers.get("fixture-session-3"), "fixture-run"); // Reconnecting preserves the expired ID, not its lost authorization state.
+    assert.deepEqual(attemptedTools, ["list_spaces", "create_agent_session", "list_spaces", "create_agent_session", "list_spaces"]);
+    assert.deepEqual(acceptedTools, ["list_spaces", "list_spaces"]);
+    assert.deepEqual(deniedTools, ["list_spaces"]);
   } finally {
     await shutdown?.();
     server.closeAllConnections();

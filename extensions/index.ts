@@ -21,6 +21,7 @@ class SylvanMcpConnection {
   private readonly transport: StreamableHTTPClientTransport;
   private readonly agentToolTimeoutMs: number;
   private readonly closeLongRunningFetch: () => Promise<void>;
+  private invalidated = false;
 
   private constructor(
     client: Client,
@@ -74,6 +75,9 @@ class SylvanMcpConnection {
         timeout: isLongRunningAgentTool(name) ? this.agentToolTimeoutMs : undefined,
       }) as McpResult;
     } catch (error) {
+      // A transport/protocol rejection may leave the cached MCP session unusable, e.g. after a
+      // session-registry reset. Do not retry here: an inference request may already have started.
+      if (!signal?.aborted && !isMcpRequestTimeout(error)) this.invalidated = true;
       // Any rejected tools/call response is ambiguous: the request may have reached Sylvan
       // even when the HTTP status, body or protocol response is invalid.
       if (isLongRunningAgentTool(name)) {
@@ -86,6 +90,10 @@ class SylvanMcpConnection {
     }
 
     return result.structuredContent ?? parseTextResult(result);
+  }
+
+  get isInvalidated(): boolean {
+    return this.invalidated;
   }
 
   async close(): Promise<void> {
@@ -103,6 +111,10 @@ class SylvanMcpConnection {
   private get sessionId(): string | undefined {
     return this.transport.sessionId;
   }
+}
+
+function isMcpRequestTimeout(error: unknown): boolean {
+  return !!error && typeof error === "object" && "code" in error && error.code === -32001;
 }
 
 function uncertainAgentCallMessage(name: string): string {
@@ -190,7 +202,18 @@ export default function registerSylvan(pi: ExtensionAPI) {
     signal?: AbortSignal,
   ): Promise<JsonValue> => {
     signal?.throwIfAborted();
-    return (await getConnection(signal)).call(name, args, signal);
+    const current = await getConnection(signal);
+    try {
+      return await current.call(name, args, signal);
+    } catch (error) {
+      // A failed inference call stays an unknown outcome; retire only this transport so a later,
+      // distinct call can initialize a fresh MCP session. Server-side live-run checks still apply.
+      if (current.isInvalidated && connection === current) {
+        connection = undefined;
+        void current.close().catch(() => undefined);
+      }
+      throw error;
+    }
   };
 
   pi.on("session_shutdown", async () => {
